@@ -1,4 +1,3 @@
-// index.js
 require("dotenv").config();
 
 const {
@@ -9,157 +8,177 @@ const {
   ButtonBuilder,
   ButtonStyle,
   Events,
+  PermissionFlagsBits,
 } = require("discord.js");
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const BOOSTER_CHANNEL_ID = process.env.BOOSTER_CHANNEL_ID;
 const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
+const TICKET_CATEGORY_ID = process.env.TICKET_CATEGORY_ID;
 
-if (!TOKEN) throw new Error("Missing DISCORD_TOKEN in .env");
-if (!BOOSTER_CHANNEL_ID) throw new Error("Missing BOOSTER_CHANNEL_ID in .env");
-if (!LOG_CHANNEL_ID) throw new Error("Missing LOG_CHANNEL_ID in .env");
+if (!TOKEN) throw new Error("Missing DISCORD_TOKEN");
+if (!BOOSTER_CHANNEL_ID) throw new Error("Missing BOOSTER_CHANNEL_ID");
+if (!LOG_CHANNEL_ID) throw new Error("Missing LOG_CHANNEL_ID");
+if (!TICKET_CATEGORY_ID) throw new Error("Missing TICKET_CATEGORY_ID");
 
-// In-memory lock (fine for now). If you want persistence later, we can add Redis/DB.
-const claimedByOrderId = new Map();
+// ---------------- In-memory state (rebuilt from logs) ----------------
+const claimedByOrderId = new Map();        // orderId -> boosterUserId
+const ticketChannelByOrderId = new Map(); // orderId -> ticketChannelId
+const customerByOrderId = new Map();      // orderId -> customerUserId
 
-// Try to extract Order ID from embed/description/content
-function extractOrderId(msg) {
-  // 1) From embed description like "**Order ID:** TD-...."
-  const emb = msg.embeds?.[0];
-  const desc = emb?.description || "";
-  const m1 = desc.match(/Order ID:\*\*\s*([A-Z0-9-]+)\b/i);
-  if (m1) return m1[1];
+// ---------------- Helpers ----------------
+const normalizeOrderId = (s) => String(s || "").trim().toUpperCase();
 
-  // 2) From embed title like "Claimable Job • TD-...."
-  const title = emb?.title || "";
-  const m2 = title.match(/\b(TD-[A-Z0-9-]+)\b/i);
-  if (m2) return m2[1];
-
-  // 3) From content
-  const content = msg.content || "";
-  const m3 = content.match(/\b(TD-[A-Z0-9-]+)\b/i);
-  if (m3) return m3[1];
-
-  return null;
+function extractOrderId(text) {
+  const m = String(text || "").match(/\b(TD-[A-Z0-9-]{6,})\b/i);
+  return m ? normalizeOrderId(m[1]) : null;
 }
 
 function buildButtons(orderId, claimedUserId = null) {
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`claim:${orderId}`)
-      .setLabel(claimedUserId ? "Claimed" : "Claim")
-      .setStyle(ButtonStyle.Success)
-      .setDisabled(!!claimedUserId),
-    new ButtonBuilder()
-      .setCustomId(`log:${orderId}`)
-      .setLabel("Log")
-      .setStyle(ButtonStyle.Secondary)
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`claim:${orderId}`)
+        .setLabel(claimedUserId ? "Claimed" : "Claim")
+        .setStyle(ButtonStyle.Success)
+        .setDisabled(!!claimedUserId),
+      new ButtonBuilder()
+        .setCustomId(`log:${orderId}`)
+        .setLabel("Log")
+        .setStyle(ButtonStyle.Secondary)
+    ),
+  ];
+}
+
+async function logRecord(client, line) {
+  const ch = await client.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
+  if (ch) await ch.send(line).catch(() => {});
+}
+
+function parseLog(line) {
+  return {
+    order: line.match(/\border=([A-Z0-9-]+)/i)?.[1],
+    booster: line.match(/\bbooster=(\d+)/)?.[1],
+    customer: line.match(/\bcustomer=(\d+)/)?.[1],
+    channel: line.match(/\bchannel=(\d+)/)?.[1],
+    tag: line.match(/^\[(\w+)\]/)?.[1],
+  };
+}
+
+async function rebuildState(client) {
+  const ch = await client.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
+  if (!ch) return;
+
+  const msgs = await ch.messages.fetch({ limit: 150 }).catch(() => null);
+  if (!msgs) return;
+
+  for (const m of msgs.values()) {
+    const p = parseLog(m.content);
+    if (!p.order || !p.tag) continue;
+
+    if (p.tag === "CLAIM" && p.booster)
+      claimedByOrderId.set(p.order, p.booster);
+
+    if (p.tag === "LINK" && p.channel && p.customer) {
+      ticketChannelByOrderId.set(p.order, p.channel);
+      customerByOrderId.set(p.order, p.customer);
+    }
+  }
+
+  console.log(
+    `🔁 State rebuilt | claims=${claimedByOrderId.size}, tickets=${ticketChannelByOrderId.size}`
   );
-
-  return [row];
 }
 
-function cloneEmbeds(msg) {
-  // webhook embed objects can be reused; just shallow clone
-  return msg.embeds?.map((e) => e.toJSON?.() ?? e) ?? [];
-}
-
+// ---------------- Client ----------------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent, // needed so we can read webhook text/content if any
+    GatewayIntentBits.MessageContent,
   ],
   partials: [Partials.Channel, Partials.Message],
 });
 
-client.once(Events.ClientReady, () => {
+client.once(Events.ClientReady, async () => {
   console.log(`✅ Bot online as ${client.user.tag}`);
+  await rebuildState(client);
 });
 
-// When webhook posts a new job in booster channel, repost with buttons
+// ---------------- Ticket channel listener ----------------
 client.on(Events.MessageCreate, async (msg) => {
   try {
-    // DEBUG: show what the bot is seeing
-    console.log(
-      `[MSG] channel=${msg.channelId} webhookId=${msg.webhookId ? "yes" : "no"} author=${msg.author?.tag}`
-    );
+    if (msg.author?.bot) return;
 
-    if (msg.channelId !== BOOSTER_CHANNEL_ID) return;
+    // Only ticket channels created by ticket bot
+    if (msg.channel?.parentId !== TICKET_CATEGORY_ID) return;
 
-    // Ignore bot messages (so it doesn't repost itself)
-    if (msg.author?.bot && !msg.webhookId) return;
+    const orderId = extractOrderId(msg.content);
+    if (!orderId) return;
 
-    // Try extract order id from content/embeds
-    const orderId = extractOrderId(msg);
-    if (!orderId) {
-      console.log("[MSG] No orderId detected, skipping.");
-      return;
+    // Link ticket to order
+    if (!ticketChannelByOrderId.has(orderId)) {
+      ticketChannelByOrderId.set(orderId, msg.channel.id);
+      customerByOrderId.set(orderId, msg.author.id);
+
+      await logRecord(
+        client,
+        `[LINK] order=${orderId} channel=${msg.channel.id} customer=${msg.author.id}`
+      );
     }
 
-    // If it already has buttons, do nothing
-    if (msg.components?.length) {
-      console.log("[MSG] Already has components, skipping.");
-      return;
-    }
+    await msg.reply(
+      "✅ Order linked. If a booster is assigned, I’ll add them here automatically."
+    ).catch(() => {});
 
-    const embeds = cloneEmbeds(msg);
-    const content = msg.content || "";
+    // If booster already claimed, add them now
+    const boosterId = claimedByOrderId.get(orderId);
+    if (boosterId) {
+      await msg.channel.permissionOverwrites.edit(boosterId, {
+        ViewChannel: true,
+        SendMessages: true,
+        ReadMessageHistory: true,
+      });
 
-    const repost = await msg.channel.send({
-      content,
-      embeds,
-      components: buildButtons(orderId, null),
-    });
-
-    console.log(`[REPOST] ${orderId} -> ${repost.url}`);
-
-    // Only try deleting if it's a webhook message (cleaner channel)
-    if (msg.webhookId) {
-      await msg.delete().catch((e) => console.log("[DELETE FAIL]", e.message));
-    }
-
-    const logCh = await client.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
-    if (logCh) {
-      await logCh.send(`🆕 Job reposted: **${orderId}**\n${repost.url}`).catch(() => {});
+      await msg.channel.send(
+        `👋 Booster assigned: <@${boosterId}>`
+      ).catch(() => {});
     }
   } catch (e) {
-    console.error("MessageCreate error:", e);
+    console.error("Ticket handler error:", e);
   }
 });
 
-
+// ---------------- Booster job buttons ----------------
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (!interaction.isButton()) return;
 
-    const [action, orderId] = interaction.customId.split(":");
-    if (!orderId) return;
+    const [action, rawOrderId] = interaction.customId.split(":");
+    const orderId = normalizeOrderId(rawOrderId);
 
-    // Only respond inside the booster channel
     if (interaction.channelId !== BOOSTER_CHANNEL_ID) {
       return interaction.reply({ content: "Wrong channel.", ephemeral: true });
     }
 
     if (action === "claim") {
-      const already = claimedByOrderId.get(orderId);
-      if (already) {
-        const who = `<@${already}>`;
+      if (claimedByOrderId.has(orderId)) {
         return interaction.reply({
-          content: `Too late — already claimed by ${who}.`,
+          content: `Already claimed by <@${claimedByOrderId.get(orderId)}>`,
           ephemeral: true,
         });
       }
 
-      // Lock it
       claimedByOrderId.set(orderId, interaction.user.id);
+      await logRecord(
+        client,
+        `[CLAIM] order=${orderId} booster=${interaction.user.id}`
+      );
 
-      // Edit the message to show claimed + disable button
-      const embeds = interaction.message.embeds?.map((e) => e.toJSON?.() ?? e) ?? [];
-      // Add a small claimed line (edit first embed)
+      // Update message UI
+      const embeds = interaction.message.embeds.map((e) => e.toJSON());
       if (embeds[0]) {
-        embeds[0].footer = embeds[0].footer || {};
-        embeds[0].footer.text = `Claimed by ${interaction.user.username}`;
+        embeds[0].footer = { text: `Claimed by ${interaction.user.username}` };
       }
 
       await interaction.update({
@@ -167,31 +186,41 @@ client.on(Events.InteractionCreate, async (interaction) => {
         components: buildButtons(orderId, interaction.user.id),
       });
 
-      // Log
-      const logCh = await client.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
-      if (logCh) {
-        await logCh.send(`✅ **${orderId}** claimed by <@${interaction.user.id}>`).catch(() => {});
+      // Add booster to ticket channel if exists
+      const ticketChannelId = ticketChannelByOrderId.get(orderId);
+      if (ticketChannelId) {
+        const ch = await client.channels.fetch(ticketChannelId).catch(() => null);
+        if (ch) {
+          await ch.permissionOverwrites.edit(interaction.user.id, {
+            ViewChannel: true,
+            SendMessages: true,
+            ReadMessageHistory: true,
+          });
+
+          await ch.send(
+            `👋 Booster assigned: <@${interaction.user.id}>`
+          ).catch(() => {});
+
+          return interaction.followUp({
+            content: `Added you to the customer ticket: <#${ch.id}>`,
+            ephemeral: true,
+          });
+        }
       }
-      return;
+
+      return interaction.followUp({
+        content:
+          "Customer hasn’t pasted the Order ID in a ticket yet. I’ll add you automatically once they do.",
+        ephemeral: true,
+      });
     }
 
     if (action === "log") {
-      const claimed = claimedByOrderId.get(orderId);
-      const claimedText = claimed ? `<@${claimed}>` : "Unclaimed";
-
-      const logCh = await client.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
-      if (logCh) {
-        await logCh.send(`📝 Log requested for **${orderId}** — status: ${claimedText}`).catch(() => {});
-      }
-
+      await logRecord(client, `📝 Log requested for ${orderId}`);
       return interaction.reply({ content: "Logged ✅", ephemeral: true });
     }
   } catch (e) {
     console.error("Interaction error:", e);
-    // If something goes wrong, at least respond
-    if (interaction?.isRepliable?.() && !interaction.replied) {
-      await interaction.reply({ content: "Error handling that.", ephemeral: true }).catch(() => {});
-    }
   }
 });
 
